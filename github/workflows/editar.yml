@@ -1,0 +1,196 @@
+name: Editar ZIP sob demanda
+
+on:
+  workflow_dispatch:
+    inputs:
+      arquivo_url:
+        description: Link HTTPS direto para o arquivo .zip (até 100 MB)
+        required: true
+        type: string
+      comando_edicao:
+        description: 'Formato seguro: SUBSTITUIR|texto antigo|texto novo'
+        required: true
+        type: string
+      nome_saida:
+        description: Nome do arquivo ZIP final
+        required: false
+        default: pronto.zip
+        type: string
+
+# run_id é único por execução, então pedidos distintos podem rodar em paralelo.
+concurrency:
+  group: ${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  editar:
+    name: Baixar, editar e entregar ZIP
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Exemplo de matrix para dividir o trabalho em 3 terminais.
+    # Só descomente depois de adaptar a divisão dos arquivos: cada terminal
+    # precisa trabalhar em arquivos diferentes para não sobrescrever mudanças.
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     terminal: [1, 2, 3]
+
+    steps:
+      - name: Validar entrada, tamanho e baixar ZIP
+        id: preparar
+        env:
+          ARQUIVO_URL: ${{ inputs.arquivo_url }}
+          NOME_SAIDA: ${{ inputs.nome_saida }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$ARQUIVO_URL" != https://* ]]; then
+            echo "arquivo_url precisa começar com https://"
+            exit 1
+          fi
+
+          nome="${NOME_SAIDA:-pronto.zip}"
+          if [[ ! "$nome" =~ ^[A-Za-z0-9._-]+\.zip$ ]]; then
+            echo "nome_saida deve ser um nome simples terminado em .zip, sem diretórios."
+            exit 1
+          fi
+
+          max_bytes=$((100 * 1024 * 1024))
+          tamanho="$(curl --silent --show-error --fail --location --head \
+            --proto '=https' --proto-redir '=https' "$ARQUIVO_URL" |
+            awk 'BEGIN { IGNORECASE=1 } /^HTTP\// { n="" } tolower($1)=="content-length:" { gsub("\r","",$2); n=$2 } END { if (n!="") print n }')"
+
+          if [[ ! "$tamanho" =~ ^[0-9]+$ ]]; then
+            echo "Não foi possível verificar o tamanho do arquivo antes do download."
+            exit 1
+          fi
+          if (( tamanho > max_bytes )); then
+            echo "Arquivo maior que 100MB, usar Daytona"
+            exit 1
+          fi
+
+          mkdir -p trabalho saida
+          curl --silent --show-error --fail --location \
+            --proto '=https' --proto-redir '=https' \
+            --max-filesize "$max_bytes" \
+            --output arquivo.zip "$ARQUIVO_URL"
+
+          if (( $(stat -c '%s' arquivo.zip) > max_bytes )); then
+            echo "Arquivo maior que 100MB, usar Daytona"
+            exit 1
+          fi
+
+          printf 'output_path=saida/%s\n' "$nome" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "$nome" >> "$GITHUB_OUTPUT"
+
+      - name: Validar ZIP e descompactar
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -tq arquivo.zip
+          python3 - <<'PY'
+          import stat, sys, zipfile
+          from pathlib import PurePosixPath
+          with zipfile.ZipFile("arquivo.zip") as z:
+              for item in z.infolist():
+                  name = item.filename
+                  mode = (item.external_attr >> 16) & 0o170000
+                  if name.startswith("/") or "\\" in name or ".." in PurePosixPath(name).parts or mode == stat.S_IFLNK:
+                      print(f"Entrada ZIP não permitida: {name!r}", file=sys.stderr)
+                      sys.exit(1)
+          PY
+          unzip -q arquivo.zip -d trabalho/
+
+      - name: Listar conteúdo e aplicar edição
+        env:
+          COMANDO_EDICAO: ${{ inputs.comando_edicao }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Arquivos e pastas:"
+          find trabalho/ -print
+          echo
+          echo "Tamanho descompactado:"
+          du -sh trabalho/
+
+          # Não executa conteúdo arbitrário enviado no input.
+          python3 - <<'PY'
+          import os, sys
+          parts = os.environ["COMANDO_EDICAO"].split("|")
+          if len(parts) != 3 or parts[0] != "SUBSTITUIR":
+              print("Use: SUBSTITUIR|texto antigo|texto novo", file=sys.stderr)
+              sys.exit(1)
+          _, old, new = parts
+          if not old or any(c in old or c in new for c in ("\n", "\r", "\0")):
+              print("Texto antigo não pode ser vazio; não use quebras de linha ou NUL.", file=sys.stderr)
+              sys.exit(1)
+          pattern = "".join("\\" + c if c in r"\.^$*[" else c for c in old)
+          replacement = new.replace("\\", "\\\\").replace("&", r"\&").replace("|", r"\|")
+          with open("/tmp/editar.sed", "w", encoding="utf-8") as f:
+              f.write(f"s|{pattern}|{replacement}|g\n")
+          PY
+
+          # Processa em lotes, preservando nomes com espaços e ignorando binários.
+          find trabalho/ -type f -print0 |
+            xargs -0 -r -n 100 bash -c '
+              for file do
+                if grep -Iq . "$file"; then
+                  sed -i -f /tmp/editar.sed "$file"
+                fi
+              done
+            ' _
+
+      - name: Recompactar e mostrar tamanho final
+        env:
+          OUTPUT_PATH: ${{ steps.preparar.outputs.output_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd trabalho/ && zip -qr "../$OUTPUT_PATH" .)
+          ls -lh "$OUTPUT_PATH"
+
+      - name: Publicar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.preparar.outputs.artifact_name }}
+          path: ${{ steps.preparar.outputs.output_path }}
+          retention-days: 1
+          if-no-files-found: error
+
+  limpar:
+    name: Apagar artifact após 2 horas
+    needs: editar
+    if: needs.editar.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    permissions:
+      actions: write
+    steps:
+      - name: Esperar e apagar artifact desta execução
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ARTIFACT_NAME: ${{ inputs.nome_saida }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 7200
+          ids="$(gh api --paginate \
+            "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name == \"$ARTIFACT_NAME\") | .id")"
+          if [[ -z "$ids" ]]; then
+            echo "Artifact não encontrado; nada para apagar."
+            exit 0
+          fi
+          while IFS= read -r artifact_id; do
+            [[ -z "$artifact_id" ]] && continue
+            gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$artifact_id"
+            echo "Artifact $artifact_id apagado."
+          done <<< "$ids"
